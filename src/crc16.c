@@ -1,9 +1,10 @@
-#include "redis.h"
+#include "server.h"
 
-/*      
+/*
  * Copyright 2001-2010 Georges Menie (www.menie.org)
- * Copyright 2010 Salvatore Sanfilippo (adapted to Redis coding style)
+ * Copyright 2010-2012 Salvatore Sanfilippo (adapted to Redis coding style)
  * All rights reserved.
+ *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions are met:
  *
@@ -28,7 +29,7 @@
  * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-/* CRC16 implementation acording to CCITT standards.
+/* CRC16 implementation according to CCITT standards.
  *
  * Note by @antirez: this is actually the XMODEM CRC 16 algorithm, using the
  * following parameters:
@@ -77,7 +78,7 @@ static const uint16_t crc16tab[256]= {
     0xef1f,0xff3e,0xcf5d,0xdf7c,0xaf9b,0xbfba,0x8fd9,0x9ff8,
     0x6e17,0x7e36,0x4e55,0x5e74,0x2e93,0x3eb2,0x0ed1,0x1ef0
 };
-  
+
 uint16_t crc16(const char *buf, int len) {
     int counter;
     uint16_t crc = 0;

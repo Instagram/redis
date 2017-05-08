@@ -1,6 +1,3 @@
-#include "redis.h"
-#include "slowlog.h"
-
 /* Slowlog implements a system that is able to remember the latest N
  * queries that took more than M microseconds to execute.
  *
@@ -9,7 +6,41 @@
  * readable and writable using the CONFIG SET/GET command.
  *
  * The slow queries log is actually not "logged" in the Redis log file
- * but is accessible thanks to the SLOWLOG command. */
+ * but is accessible thanks to the SLOWLOG command.
+ *
+ * ----------------------------------------------------------------------------
+ *
+ * Copyright (c) 2009-2012, Salvatore Sanfilippo <antirez at gmail dot com>
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ *   * Redistributions of source code must retain the above copyright notice,
+ *     this list of conditions and the following disclaimer.
+ *   * Redistributions in binary form must reproduce the above copyright
+ *     notice, this list of conditions and the following disclaimer in the
+ *     documentation and/or other materials provided with the distribution.
+ *   * Neither the name of Redis nor the names of its contributors may be used
+ *     to endorse or promote products derived from this software without
+ *     specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ */
+
+
+#include "server.h"
+#include "slowlog.h"
 
 /* Create a new slowlog entry.
  * Incrementing the ref count of all the objects retained is up to
@@ -26,13 +57,13 @@ slowlogEntry *slowlogCreateEntry(robj **argv, int argc, long long duration) {
          * at SLOWLOG_ENTRY_MAX_ARGC, but use the last argument to specify
          * how many remaining arguments there were in the original command. */
         if (slargc != argc && j == slargc-1) {
-            se->argv[j] = createObject(REDIS_STRING,
+            se->argv[j] = createObject(OBJ_STRING,
                 sdscatprintf(sdsempty(),"... (%d more arguments)",
                 argc-slargc+1));
         } else {
             /* Trim too long strings as well... */
-            if (argv[j]->type == REDIS_STRING &&
-                argv[j]->encoding == REDIS_ENCODING_RAW &&
+            if (argv[j]->type == OBJ_STRING &&
+                sdsEncodedObject(argv[j]) &&
                 sdslen(argv[j]->ptr) > SLOWLOG_ENTRY_MAX_STRING)
             {
                 sds s = sdsnewlen(argv[j]->ptr, SLOWLOG_ENTRY_MAX_STRING);
@@ -40,7 +71,7 @@ slowlogEntry *slowlogCreateEntry(robj **argv, int argc, long long duration) {
                 s = sdscatprintf(s,"... (%lu more bytes)",
                     (unsigned long)
                     sdslen(argv[j]->ptr) - SLOWLOG_ENTRY_MAX_STRING);
-                se->argv[j] = createObject(REDIS_STRING,s);
+                se->argv[j] = createObject(OBJ_STRING,s);
             } else {
                 se->argv[j] = argv[j];
                 incrRefCount(argv[j]);
@@ -96,7 +127,7 @@ void slowlogReset(void) {
 
 /* The SLOWLOG command. Implements all the subcommands needed to handle the
  * Redis slow log. */
-void slowlogCommand(redisClient *c) {
+void slowlogCommand(client *c) {
     if (c->argc == 2 && !strcasecmp(c->argv[1]->ptr,"reset")) {
         slowlogReset();
         addReply(c,shared.ok);
@@ -112,7 +143,7 @@ void slowlogCommand(redisClient *c) {
         slowlogEntry *se;
 
         if (c->argc == 3 &&
-            getLongFromObjectOrReply(c,c->argv[2],&count,NULL) != REDIS_OK)
+            getLongFromObjectOrReply(c,c->argv[2],&count,NULL) != C_OK)
             return;
 
         listRewind(server.slowlog,&li);

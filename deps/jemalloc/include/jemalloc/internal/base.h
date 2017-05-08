@@ -9,12 +9,12 @@
 /******************************************************************************/
 #ifdef JEMALLOC_H_EXTERNS
 
-extern malloc_mutex_t	base_mtx;
-
 void	*base_alloc(size_t size);
-extent_node_t *base_node_alloc(void);
-void	base_node_dealloc(extent_node_t *node);
+void	base_stats_get(size_t *allocated, size_t *resident, size_t *mapped);
 bool	base_boot(void);
+void	base_prefork(void);
+void	base_postfork_parent(void);
+void	base_postfork_child(void);
 
 #endif /* JEMALLOC_H_EXTERNS */
 /******************************************************************************/

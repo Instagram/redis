@@ -2,7 +2,7 @@
  * for the Jim's event-loop (Jim is a Tcl interpreter) but later translated
  * it in form of a library for easy reuse.
  *
- * Copyright (c) 2006-2010, Salvatore Sanfilippo <antirez at gmail dot com>
+ * Copyright (c) 2006-2012, Salvatore Sanfilippo <antirez at gmail dot com>
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -33,6 +33,8 @@
 #ifndef __AE_H__
 #define __AE_H__
 
+#include <time.h>
+
 #define AE_OK 0
 #define AE_ERR -1
 
@@ -46,6 +48,7 @@
 #define AE_DONT_WAIT 4
 
 #define AE_NOMORE -1
+#define AE_DELETED_EVENT_ID -1
 
 /* Macros */
 #define AE_NOTUSED(V) ((void) V)
@@ -88,6 +91,7 @@ typedef struct aeEventLoop {
     int maxfd;   /* highest file descriptor currently registered */
     int setsize; /* max number of file descriptors tracked */
     long long timeEventNextId;
+    time_t lastTime;     /* Used to detect system clock skew */
     aeFileEvent *events; /* Registered events */
     aeFiredEvent *fired; /* Fired events */
     aeTimeEvent *timeEventHead;
@@ -113,5 +117,7 @@ int aeWait(int fd, int mask, long long milliseconds);
 void aeMain(aeEventLoop *eventLoop);
 char *aeGetApiName(void);
 void aeSetBeforeSleepProc(aeEventLoop *eventLoop, aeBeforeSleepProc *beforesleep);
+int aeGetSetSize(aeEventLoop *eventLoop);
+int aeResizeSetSize(aeEventLoop *eventLoop, int setsize);
 
 #endif

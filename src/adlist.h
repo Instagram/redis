@@ -1,6 +1,6 @@
 /* adlist.h - A generic doubly linked list implementation
  *
- * Copyright (c) 2006-2010, Salvatore Sanfilippo <antirez at gmail dot com>
+ * Copyright (c) 2006-2012, Salvatore Sanfilippo <antirez at gmail dot com>
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -72,6 +72,7 @@ typedef struct list {
 /* Prototypes */
 list *listCreate(void);
 void listRelease(list *list);
+void listEmpty(list *list);
 list *listAddNodeHead(list *list, void *value);
 list *listAddNodeTail(list *list, void *value);
 list *listInsertNode(list *list, listNode *old_node, void *value, int after);
