@@ -52,10 +52,8 @@ list *listCreate(void)
     return list;
 }
 
-/* Free the whole list.
- *
- * This function can't fail. */
-void listRelease(list *list)
+/* Remove all the elements from the list without destroying the list itself. */
+void listEmpty(list *list)
 {
     unsigned long len;
     listNode *current, *next;
@@ -68,10 +66,20 @@ void listRelease(list *list)
         zfree(current);
         current = next;
     }
+    list->head = list->tail = NULL;
+    list->len = 0;
+}
+
+/* Free the whole list.
+ *
+ * This function can't fail. */
+void listRelease(list *list)
+{
+    listEmpty(list);
     zfree(list);
 }
 
-/* Add a new node to the list, to head, contaning the specified 'value'
+/* Add a new node to the list, to head, containing the specified 'value'
  * pointer as value.
  *
  * On error, NULL is returned and no operation is performed (i.e. the
@@ -97,7 +105,7 @@ list *listAddNodeHead(list *list, void *value)
     return list;
 }
 
-/* Add a new node to the list, to tail, contaning the specified 'value'
+/* Add a new node to the list, to tail, containing the specified 'value'
  * pointer as value.
  *
  * On error, NULL is returned and no operation is performed (i.e. the
@@ -178,7 +186,7 @@ void listDelNode(list *list, listNode *node)
 listIter *listGetIterator(list *list, int direction)
 {
     listIter *iter;
-    
+
     if ((iter = zmalloc(sizeof(*iter))) == NULL) return NULL;
     if (direction == AL_START_HEAD)
         iter->next = list->head;
@@ -242,7 +250,7 @@ listNode *listNext(listIter *iter)
 list *listDup(list *orig)
 {
     list *copy;
-    listIter *iter;
+    listIter iter;
     listNode *node;
 
     if ((copy = listCreate()) == NULL)
@@ -250,26 +258,23 @@ list *listDup(list *orig)
     copy->dup = orig->dup;
     copy->free = orig->free;
     copy->match = orig->match;
-    iter = listGetIterator(orig, AL_START_HEAD);
-    while((node = listNext(iter)) != NULL) {
+    listRewind(orig, &iter);
+    while((node = listNext(&iter)) != NULL) {
         void *value;
 
         if (copy->dup) {
             value = copy->dup(node->value);
             if (value == NULL) {
                 listRelease(copy);
-                listReleaseIterator(iter);
                 return NULL;
             }
         } else
             value = node->value;
         if (listAddNodeTail(copy, value) == NULL) {
             listRelease(copy);
-            listReleaseIterator(iter);
             return NULL;
         }
     }
-    listReleaseIterator(iter);
     return copy;
 }
 
@@ -284,31 +289,28 @@ list *listDup(list *orig)
  * NULL is returned. */
 listNode *listSearchKey(list *list, void *key)
 {
-    listIter *iter;
+    listIter iter;
     listNode *node;
 
-    iter = listGetIterator(list, AL_START_HEAD);
-    while((node = listNext(iter)) != NULL) {
+    listRewind(list, &iter);
+    while((node = listNext(&iter)) != NULL) {
         if (list->match) {
             if (list->match(node->value, key)) {
-                listReleaseIterator(iter);
                 return node;
             }
         } else {
             if (key == node->value) {
-                listReleaseIterator(iter);
                 return node;
             }
         }
     }
-    listReleaseIterator(iter);
     return NULL;
 }
 
 /* Return the element at the specified zero-based index
  * where 0 is the head, 1 is the element next to head
  * and so on. Negative integers are used in order to count
- * from the tail, -1 is the last element, -2 the penultimante
+ * from the tail, -1 is the last element, -2 the penultimate
  * and so on. If the index is out of range NULL is returned. */
 listNode *listIndex(list *list, long index) {
     listNode *n;
@@ -330,7 +332,7 @@ void listRotate(list *list) {
 
     if (listLength(list) <= 1) return;
 
-    /* Detatch current tail */
+    /* Detach current tail */
     list->tail = tail->prev;
     list->tail->next = NULL;
     /* Move it as head */

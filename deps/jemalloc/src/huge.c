@@ -2,385 +2,434 @@
 #include "jemalloc/internal/jemalloc_internal.h"
 
 /******************************************************************************/
-/* Data. */
 
-#ifdef JEMALLOC_STATS
-uint64_t	huge_nmalloc;
-uint64_t	huge_ndalloc;
-size_t		huge_allocated;
-#endif
+static extent_node_t *
+huge_node_get(const void *ptr)
+{
+	extent_node_t *node;
 
-malloc_mutex_t	huge_mtx;
+	node = chunk_lookup(ptr, true);
+	assert(!extent_node_achunk_get(node));
 
-/******************************************************************************/
+	return (node);
+}
 
-/* Tree of chunks that are stand-alone huge allocations. */
-static extent_tree_t	huge;
+static bool
+huge_node_set(const void *ptr, extent_node_t *node)
+{
+
+	assert(extent_node_addr_get(node) == ptr);
+	assert(!extent_node_achunk_get(node));
+	return (chunk_register(ptr, node));
+}
+
+static void
+huge_node_unset(const void *ptr, const extent_node_t *node)
+{
+
+	chunk_deregister(ptr, node);
+}
 
 void *
-huge_malloc(size_t size, bool zero)
+huge_malloc(tsd_t *tsd, arena_t *arena, size_t size, bool zero,
+    tcache_t *tcache)
+{
+	size_t usize;
+
+	usize = s2u(size);
+	if (usize == 0) {
+		/* size_t overflow. */
+		return (NULL);
+	}
+
+	return (huge_palloc(tsd, arena, usize, chunksize, zero, tcache));
+}
+
+void *
+huge_palloc(tsd_t *tsd, arena_t *arena, size_t size, size_t alignment,
+    bool zero, tcache_t *tcache)
 {
 	void *ret;
-	size_t csize;
+	size_t usize;
 	extent_node_t *node;
+	bool is_zeroed;
 
 	/* Allocate one or more contiguous chunks for this request. */
 
-	csize = CHUNK_CEILING(size);
-	if (csize == 0) {
-		/* size is large enough to cause size_t wrap-around. */
+	usize = sa2u(size, alignment);
+	if (unlikely(usize == 0))
 		return (NULL);
-	}
+	assert(usize >= chunksize);
 
 	/* Allocate an extent node with which to track the chunk. */
-	node = base_node_alloc();
+	node = ipallocztm(tsd, CACHELINE_CEILING(sizeof(extent_node_t)),
+	    CACHELINE, false, tcache, true, arena);
 	if (node == NULL)
 		return (NULL);
 
-	ret = chunk_alloc(csize, false, &zero);
-	if (ret == NULL) {
-		base_node_dealloc(node);
+	/*
+	 * Copy zero into is_zeroed and pass the copy to chunk_alloc(), so that
+	 * it is possible to make correct junk/zero fill decisions below.
+	 */
+	is_zeroed = zero;
+	arena = arena_choose(tsd, arena);
+	if (unlikely(arena == NULL) || (ret = arena_chunk_alloc_huge(arena,
+	    size, alignment, &is_zeroed)) == NULL) {
+		idalloctm(tsd, node, tcache, true);
+		return (NULL);
+	}
+
+	extent_node_init(node, arena, ret, size, is_zeroed, true);
+
+	if (huge_node_set(ret, node)) {
+		arena_chunk_dalloc_huge(arena, ret, size);
+		idalloctm(tsd, node, tcache, true);
 		return (NULL);
 	}
 
 	/* Insert node into huge. */
-	node->addr = ret;
-	node->size = csize;
+	malloc_mutex_lock(&arena->huge_mtx);
+	ql_elm_new(node, ql_link);
+	ql_tail_insert(&arena->huge, node, ql_link);
+	malloc_mutex_unlock(&arena->huge_mtx);
 
-	malloc_mutex_lock(&huge_mtx);
-	extent_tree_ad_insert(&huge, node);
-#ifdef JEMALLOC_STATS
-	stats_cactive_add(csize);
-	huge_nmalloc++;
-	huge_allocated += csize;
-#endif
-	malloc_mutex_unlock(&huge_mtx);
-
-#ifdef JEMALLOC_FILL
-	if (zero == false) {
-		if (opt_junk)
-			memset(ret, 0xa5, csize);
-		else if (opt_zero)
-			memset(ret, 0, csize);
-	}
-#endif
+	if (zero || (config_fill && unlikely(opt_zero))) {
+		if (!is_zeroed)
+			memset(ret, 0, size);
+	} else if (config_fill && unlikely(opt_junk_alloc))
+		memset(ret, 0xa5, size);
 
 	return (ret);
 }
 
-/* Only handles large allocations that require more than chunk alignment. */
-void *
-huge_palloc(size_t size, size_t alignment, bool zero)
+#ifdef JEMALLOC_JET
+#undef huge_dalloc_junk
+#define	huge_dalloc_junk JEMALLOC_N(huge_dalloc_junk_impl)
+#endif
+static void
+huge_dalloc_junk(void *ptr, size_t usize)
 {
-	void *ret;
-	size_t alloc_size, chunk_size, offset;
+
+	if (config_fill && have_dss && unlikely(opt_junk_free)) {
+		/*
+		 * Only bother junk filling if the chunk isn't about to be
+		 * unmapped.
+		 */
+		if (!config_munmap || (have_dss && chunk_in_dss(ptr)))
+			memset(ptr, 0x5a, usize);
+	}
+}
+#ifdef JEMALLOC_JET
+#undef huge_dalloc_junk
+#define	huge_dalloc_junk JEMALLOC_N(huge_dalloc_junk)
+huge_dalloc_junk_t *huge_dalloc_junk = JEMALLOC_N(huge_dalloc_junk_impl);
+#endif
+
+static void
+huge_ralloc_no_move_similar(void *ptr, size_t oldsize, size_t usize_min,
+    size_t usize_max, bool zero)
+{
+	size_t usize, usize_next;
 	extent_node_t *node;
+	arena_t *arena;
+	chunk_hooks_t chunk_hooks = CHUNK_HOOKS_INITIALIZER;
+	bool pre_zeroed, post_zeroed;
 
-	/*
-	 * This allocation requires alignment that is even larger than chunk
-	 * alignment.  This means that huge_malloc() isn't good enough.
-	 *
-	 * Allocate almost twice as many chunks as are demanded by the size or
-	 * alignment, in order to assure the alignment can be achieved, then
-	 * unmap leading and trailing chunks.
-	 */
-	assert(alignment > chunksize);
+	/* Increase usize to incorporate extra. */
+	for (usize = usize_min; usize < usize_max && (usize_next = s2u(usize+1))
+	    <= oldsize; usize = usize_next)
+		; /* Do nothing. */
 
-	chunk_size = CHUNK_CEILING(size);
+	if (oldsize == usize)
+		return;
 
-	if (size >= alignment)
-		alloc_size = chunk_size + alignment - chunksize;
-	else
-		alloc_size = (alignment << 1) - chunksize;
+	node = huge_node_get(ptr);
+	arena = extent_node_arena_get(node);
+	pre_zeroed = extent_node_zeroed_get(node);
 
-	/* Allocate an extent node with which to track the chunk. */
-	node = base_node_alloc();
-	if (node == NULL)
-		return (NULL);
+	/* Fill if necessary (shrinking). */
+	if (oldsize > usize) {
+		size_t sdiff = oldsize - usize;
+		if (config_fill && unlikely(opt_junk_free)) {
+			memset((void *)((uintptr_t)ptr + usize), 0x5a, sdiff);
+			post_zeroed = false;
+		} else {
+			post_zeroed = !chunk_purge_wrapper(arena, &chunk_hooks,
+			    ptr, CHUNK_CEILING(oldsize), usize, sdiff);
+		}
+	} else
+		post_zeroed = pre_zeroed;
 
-	ret = chunk_alloc(alloc_size, false, &zero);
-	if (ret == NULL) {
-		base_node_dealloc(node);
-		return (NULL);
-	}
+	malloc_mutex_lock(&arena->huge_mtx);
+	/* Update the size of the huge allocation. */
+	assert(extent_node_size_get(node) != usize);
+	extent_node_size_set(node, usize);
+	/* Update zeroed. */
+	extent_node_zeroed_set(node, post_zeroed);
+	malloc_mutex_unlock(&arena->huge_mtx);
 
-	offset = (uintptr_t)ret & (alignment - 1);
-	assert((offset & chunksize_mask) == 0);
-	assert(offset < alloc_size);
-	if (offset == 0) {
-		/* Trim trailing space. */
-		chunk_dealloc((void *)((uintptr_t)ret + chunk_size), alloc_size
-		    - chunk_size, true);
-	} else {
-		size_t trailsize;
+	arena_chunk_ralloc_huge_similar(arena, ptr, oldsize, usize);
 
-		/* Trim leading space. */
-		chunk_dealloc(ret, alignment - offset, true);
-
-		ret = (void *)((uintptr_t)ret + (alignment - offset));
-
-		trailsize = alloc_size - (alignment - offset) - chunk_size;
-		if (trailsize != 0) {
-		    /* Trim trailing space. */
-		    assert(trailsize < alloc_size);
-		    chunk_dealloc((void *)((uintptr_t)ret + chunk_size),
-			trailsize, true);
+	/* Fill if necessary (growing). */
+	if (oldsize < usize) {
+		if (zero || (config_fill && unlikely(opt_zero))) {
+			if (!pre_zeroed) {
+				memset((void *)((uintptr_t)ptr + oldsize), 0,
+				    usize - oldsize);
+			}
+		} else if (config_fill && unlikely(opt_junk_alloc)) {
+			memset((void *)((uintptr_t)ptr + oldsize), 0xa5, usize -
+			    oldsize);
 		}
 	}
-
-	/* Insert node into huge. */
-	node->addr = ret;
-	node->size = chunk_size;
-
-	malloc_mutex_lock(&huge_mtx);
-	extent_tree_ad_insert(&huge, node);
-#ifdef JEMALLOC_STATS
-	stats_cactive_add(chunk_size);
-	huge_nmalloc++;
-	huge_allocated += chunk_size;
-#endif
-	malloc_mutex_unlock(&huge_mtx);
-
-#ifdef JEMALLOC_FILL
-	if (zero == false) {
-		if (opt_junk)
-			memset(ret, 0xa5, chunk_size);
-		else if (opt_zero)
-			memset(ret, 0, chunk_size);
-	}
-#endif
-
-	return (ret);
 }
 
-void *
-huge_ralloc_no_move(void *ptr, size_t oldsize, size_t size, size_t extra)
+static bool
+huge_ralloc_no_move_shrink(void *ptr, size_t oldsize, size_t usize)
+{
+	extent_node_t *node;
+	arena_t *arena;
+	chunk_hooks_t chunk_hooks;
+	size_t cdiff;
+	bool pre_zeroed, post_zeroed;
+
+	node = huge_node_get(ptr);
+	arena = extent_node_arena_get(node);
+	pre_zeroed = extent_node_zeroed_get(node);
+	chunk_hooks = chunk_hooks_get(arena);
+
+	assert(oldsize > usize);
+
+	/* Split excess chunks. */
+	cdiff = CHUNK_CEILING(oldsize) - CHUNK_CEILING(usize);
+	if (cdiff != 0 && chunk_hooks.split(ptr, CHUNK_CEILING(oldsize),
+	    CHUNK_CEILING(usize), cdiff, true, arena->ind))
+		return (true);
+
+	if (oldsize > usize) {
+		size_t sdiff = oldsize - usize;
+		if (config_fill && unlikely(opt_junk_free)) {
+			huge_dalloc_junk((void *)((uintptr_t)ptr + usize),
+			    sdiff);
+			post_zeroed = false;
+		} else {
+			post_zeroed = !chunk_purge_wrapper(arena, &chunk_hooks,
+			    CHUNK_ADDR2BASE((uintptr_t)ptr + usize),
+			    CHUNK_CEILING(oldsize),
+			    CHUNK_ADDR2OFFSET((uintptr_t)ptr + usize), sdiff);
+		}
+	} else
+		post_zeroed = pre_zeroed;
+
+	malloc_mutex_lock(&arena->huge_mtx);
+	/* Update the size of the huge allocation. */
+	extent_node_size_set(node, usize);
+	/* Update zeroed. */
+	extent_node_zeroed_set(node, post_zeroed);
+	malloc_mutex_unlock(&arena->huge_mtx);
+
+	/* Zap the excess chunks. */
+	arena_chunk_ralloc_huge_shrink(arena, ptr, oldsize, usize);
+
+	return (false);
+}
+
+static bool
+huge_ralloc_no_move_expand(void *ptr, size_t oldsize, size_t usize, bool zero) {
+	extent_node_t *node;
+	arena_t *arena;
+	bool is_zeroed_subchunk, is_zeroed_chunk;
+
+	node = huge_node_get(ptr);
+	arena = extent_node_arena_get(node);
+	malloc_mutex_lock(&arena->huge_mtx);
+	is_zeroed_subchunk = extent_node_zeroed_get(node);
+	malloc_mutex_unlock(&arena->huge_mtx);
+
+	/*
+	 * Copy zero into is_zeroed_chunk and pass the copy to chunk_alloc(), so
+	 * that it is possible to make correct junk/zero fill decisions below.
+	 */
+	is_zeroed_chunk = zero;
+
+	if (arena_chunk_ralloc_huge_expand(arena, ptr, oldsize, usize,
+	     &is_zeroed_chunk))
+		return (true);
+
+	malloc_mutex_lock(&arena->huge_mtx);
+	/* Update the size of the huge allocation. */
+	extent_node_size_set(node, usize);
+	malloc_mutex_unlock(&arena->huge_mtx);
+
+	if (zero || (config_fill && unlikely(opt_zero))) {
+		if (!is_zeroed_subchunk) {
+			memset((void *)((uintptr_t)ptr + oldsize), 0,
+			    CHUNK_CEILING(oldsize) - oldsize);
+		}
+		if (!is_zeroed_chunk) {
+			memset((void *)((uintptr_t)ptr +
+			    CHUNK_CEILING(oldsize)), 0, usize -
+			    CHUNK_CEILING(oldsize));
+		}
+	} else if (config_fill && unlikely(opt_junk_alloc)) {
+		memset((void *)((uintptr_t)ptr + oldsize), 0xa5, usize -
+		    oldsize);
+	}
+
+	return (false);
+}
+
+bool
+huge_ralloc_no_move(void *ptr, size_t oldsize, size_t usize_min,
+    size_t usize_max, bool zero)
 {
 
-	/*
-	 * Avoid moving the allocation if the size class can be left the same.
-	 */
-	if (oldsize > arena_maxclass
-	    && CHUNK_CEILING(oldsize) >= CHUNK_CEILING(size)
-	    && CHUNK_CEILING(oldsize) <= CHUNK_CEILING(size+extra)) {
-		assert(CHUNK_CEILING(oldsize) == oldsize);
-#ifdef JEMALLOC_FILL
-		if (opt_junk && size < oldsize) {
-			memset((void *)((uintptr_t)ptr + size), 0x5a,
-			    oldsize - size);
-		}
-#endif
-		return (ptr);
+	assert(s2u(oldsize) == oldsize);
+
+	/* Both allocations must be huge to avoid a move. */
+	if (oldsize < chunksize || usize_max < chunksize)
+		return (true);
+
+	if (CHUNK_CEILING(usize_max) > CHUNK_CEILING(oldsize)) {
+		/* Attempt to expand the allocation in-place. */
+		if (!huge_ralloc_no_move_expand(ptr, oldsize, usize_max, zero))
+			return (false);
+		/* Try again, this time with usize_min. */
+		if (usize_min < usize_max && CHUNK_CEILING(usize_min) >
+		    CHUNK_CEILING(oldsize) && huge_ralloc_no_move_expand(ptr,
+		    oldsize, usize_min, zero))
+			return (false);
 	}
 
-	/* Reallocation would require a move. */
-	return (NULL);
+	/*
+	 * Avoid moving the allocation if the existing chunk size accommodates
+	 * the new size.
+	 */
+	if (CHUNK_CEILING(oldsize) >= CHUNK_CEILING(usize_min)
+	    && CHUNK_CEILING(oldsize) <= CHUNK_CEILING(usize_max)) {
+		huge_ralloc_no_move_similar(ptr, oldsize, usize_min, usize_max,
+		    zero);
+		return (false);
+	}
+
+	/* Attempt to shrink the allocation in-place. */
+	if (CHUNK_CEILING(oldsize) > CHUNK_CEILING(usize_max))
+		return (huge_ralloc_no_move_shrink(ptr, oldsize, usize_max));
+	return (true);
+}
+
+static void *
+huge_ralloc_move_helper(tsd_t *tsd, arena_t *arena, size_t usize,
+    size_t alignment, bool zero, tcache_t *tcache)
+{
+
+	if (alignment <= chunksize)
+		return (huge_malloc(tsd, arena, usize, zero, tcache));
+	return (huge_palloc(tsd, arena, usize, alignment, zero, tcache));
 }
 
 void *
-huge_ralloc(void *ptr, size_t oldsize, size_t size, size_t extra,
-    size_t alignment, bool zero)
+huge_ralloc(tsd_t *tsd, arena_t *arena, void *ptr, size_t oldsize, size_t usize,
+    size_t alignment, bool zero, tcache_t *tcache)
 {
 	void *ret;
 	size_t copysize;
 
 	/* Try to avoid moving the allocation. */
-	ret = huge_ralloc_no_move(ptr, oldsize, size, extra);
-	if (ret != NULL)
-		return (ret);
+	if (!huge_ralloc_no_move(ptr, oldsize, usize, usize, zero))
+		return (ptr);
 
 	/*
-	 * size and oldsize are different enough that we need to use a
+	 * usize and oldsize are different enough that we need to use a
 	 * different size class.  In that case, fall back to allocating new
 	 * space and copying.
 	 */
-	if (alignment > chunksize)
-		ret = huge_palloc(size + extra, alignment, zero);
-	else
-		ret = huge_malloc(size + extra, zero);
+	ret = huge_ralloc_move_helper(tsd, arena, usize, alignment, zero,
+	    tcache);
+	if (ret == NULL)
+		return (NULL);
 
-	if (ret == NULL) {
-		if (extra == 0)
-			return (NULL);
-		/* Try again, this time without extra. */
-		if (alignment > chunksize)
-			ret = huge_palloc(size, alignment, zero);
-		else
-			ret = huge_malloc(size, zero);
-
-		if (ret == NULL)
-			return (NULL);
-	}
-
-	/*
-	 * Copy at most size bytes (not size+extra), since the caller has no
-	 * expectation that the extra bytes will be reliably preserved.
-	 */
-	copysize = (size < oldsize) ? size : oldsize;
-
-	/*
-	 * Use mremap(2) if this is a huge-->huge reallocation, and neither the
-	 * source nor the destination are in swap or dss.
-	 */
-#ifdef JEMALLOC_MREMAP_FIXED
-	if (oldsize >= chunksize
-#  ifdef JEMALLOC_SWAP
-	    && (swap_enabled == false || (chunk_in_swap(ptr) == false &&
-	    chunk_in_swap(ret) == false))
-#  endif
-#  ifdef JEMALLOC_DSS
-	    && chunk_in_dss(ptr) == false && chunk_in_dss(ret) == false
-#  endif
-	    ) {
-		size_t newsize = huge_salloc(ret);
-
-		/*
-		 * Remove ptr from the tree of huge allocations before
-		 * performing the remap operation, in order to avoid the
-		 * possibility of another thread acquiring that mapping before
-		 * this one removes it from the tree.
-		 */
-		huge_dalloc(ptr, false);
-		if (mremap(ptr, oldsize, newsize, MREMAP_MAYMOVE|MREMAP_FIXED,
-		    ret) == MAP_FAILED) {
-			/*
-			 * Assuming no chunk management bugs in the allocator,
-			 * the only documented way an error can occur here is
-			 * if the application changed the map type for a
-			 * portion of the old allocation.  This is firmly in
-			 * undefined behavior territory, so write a diagnostic
-			 * message, and optionally abort.
-			 */
-			char buf[BUFERROR_BUF];
-
-			buferror(errno, buf, sizeof(buf));
-			malloc_write("<jemalloc>: Error in mremap(): ");
-			malloc_write(buf);
-			malloc_write("\n");
-			if (opt_abort)
-				abort();
-			memcpy(ret, ptr, copysize);
-			chunk_dealloc_mmap(ptr, oldsize);
-		}
-	} else
-#endif
-	{
-		memcpy(ret, ptr, copysize);
-		idalloc(ptr);
-	}
+	copysize = (usize < oldsize) ? usize : oldsize;
+	memcpy(ret, ptr, copysize);
+	isqalloc(tsd, ptr, oldsize, tcache);
 	return (ret);
 }
 
 void
-huge_dalloc(void *ptr, bool unmap)
+huge_dalloc(tsd_t *tsd, void *ptr, tcache_t *tcache)
 {
-	extent_node_t *node, key;
+	extent_node_t *node;
+	arena_t *arena;
 
-	malloc_mutex_lock(&huge_mtx);
+	node = huge_node_get(ptr);
+	arena = extent_node_arena_get(node);
+	huge_node_unset(ptr, node);
+	malloc_mutex_lock(&arena->huge_mtx);
+	ql_remove(&arena->huge, node, ql_link);
+	malloc_mutex_unlock(&arena->huge_mtx);
 
-	/* Extract from tree of huge allocations. */
-	key.addr = ptr;
-	node = extent_tree_ad_search(&huge, &key);
-	assert(node != NULL);
-	assert(node->addr == ptr);
-	extent_tree_ad_remove(&huge, node);
+	huge_dalloc_junk(extent_node_addr_get(node),
+	    extent_node_size_get(node));
+	arena_chunk_dalloc_huge(extent_node_arena_get(node),
+	    extent_node_addr_get(node), extent_node_size_get(node));
+	idalloctm(tsd, node, tcache, true);
+}
 
-#ifdef JEMALLOC_STATS
-	stats_cactive_sub(node->size);
-	huge_ndalloc++;
-	huge_allocated -= node->size;
-#endif
+arena_t *
+huge_aalloc(const void *ptr)
+{
 
-	malloc_mutex_unlock(&huge_mtx);
-
-	if (unmap) {
-	/* Unmap chunk. */
-#ifdef JEMALLOC_FILL
-#if (defined(JEMALLOC_SWAP) || defined(JEMALLOC_DSS))
-		if (opt_junk)
-			memset(node->addr, 0x5a, node->size);
-#endif
-#endif
-	}
-
-	chunk_dealloc(node->addr, node->size, unmap);
-
-	base_node_dealloc(node);
+	return (extent_node_arena_get(huge_node_get(ptr)));
 }
 
 size_t
 huge_salloc(const void *ptr)
 {
-	size_t ret;
-	extent_node_t *node, key;
+	size_t size;
+	extent_node_t *node;
+	arena_t *arena;
 
-	malloc_mutex_lock(&huge_mtx);
+	node = huge_node_get(ptr);
+	arena = extent_node_arena_get(node);
+	malloc_mutex_lock(&arena->huge_mtx);
+	size = extent_node_size_get(node);
+	malloc_mutex_unlock(&arena->huge_mtx);
 
-	/* Extract from tree of huge allocations. */
-	key.addr = __DECONST(void *, ptr);
-	node = extent_tree_ad_search(&huge, &key);
-	assert(node != NULL);
-
-	ret = node->size;
-
-	malloc_mutex_unlock(&huge_mtx);
-
-	return (ret);
+	return (size);
 }
 
-#ifdef JEMALLOC_PROF
-prof_ctx_t *
-huge_prof_ctx_get(const void *ptr)
+prof_tctx_t *
+huge_prof_tctx_get(const void *ptr)
 {
-	prof_ctx_t *ret;
-	extent_node_t *node, key;
+	prof_tctx_t *tctx;
+	extent_node_t *node;
+	arena_t *arena;
 
-	malloc_mutex_lock(&huge_mtx);
+	node = huge_node_get(ptr);
+	arena = extent_node_arena_get(node);
+	malloc_mutex_lock(&arena->huge_mtx);
+	tctx = extent_node_prof_tctx_get(node);
+	malloc_mutex_unlock(&arena->huge_mtx);
 
-	/* Extract from tree of huge allocations. */
-	key.addr = __DECONST(void *, ptr);
-	node = extent_tree_ad_search(&huge, &key);
-	assert(node != NULL);
-
-	ret = node->prof_ctx;
-
-	malloc_mutex_unlock(&huge_mtx);
-
-	return (ret);
+	return (tctx);
 }
 
 void
-huge_prof_ctx_set(const void *ptr, prof_ctx_t *ctx)
+huge_prof_tctx_set(const void *ptr, prof_tctx_t *tctx)
 {
-	extent_node_t *node, key;
+	extent_node_t *node;
+	arena_t *arena;
 
-	malloc_mutex_lock(&huge_mtx);
-
-	/* Extract from tree of huge allocations. */
-	key.addr = __DECONST(void *, ptr);
-	node = extent_tree_ad_search(&huge, &key);
-	assert(node != NULL);
-
-	node->prof_ctx = ctx;
-
-	malloc_mutex_unlock(&huge_mtx);
+	node = huge_node_get(ptr);
+	arena = extent_node_arena_get(node);
+	malloc_mutex_lock(&arena->huge_mtx);
+	extent_node_prof_tctx_set(node, tctx);
+	malloc_mutex_unlock(&arena->huge_mtx);
 }
-#endif
 
-bool
-huge_boot(void)
+void
+huge_prof_tctx_reset(const void *ptr)
 {
 
-	/* Initialize chunks data. */
-	if (malloc_mutex_init(&huge_mtx))
-		return (true);
-	extent_tree_ad_new(&huge);
-
-#ifdef JEMALLOC_STATS
-	huge_nmalloc = 0;
-	huge_ndalloc = 0;
-	huge_allocated = 0;
-#endif
-
-	return (false);
+	huge_prof_tctx_set(ptr, (prof_tctx_t *)(uintptr_t)1U);
 }

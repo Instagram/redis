@@ -1,8 +1,42 @@
+/*
+ * Copyright (c) 2009-2012, Salvatore Sanfilippo <antirez at gmail dot com>
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ *   * Redistributions of source code must retain the above copyright notice,
+ *     this list of conditions and the following disclaimer.
+ *   * Redistributions in binary form must reproduce the above copyright
+ *     notice, this list of conditions and the following disclaimer in the
+ *     documentation and/or other materials provided with the distribution.
+ *   * Neither the name of Redis nor the names of its contributors may be used
+ *     to endorse or promote products derived from this software without
+ *     specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ */
+
 #ifndef __CONFIG_H
 #define __CONFIG_H
 
 #ifdef __APPLE__
 #include <AvailabilityMacros.h>
+#endif
+
+#ifdef __linux__
+#include <linux/version.h>
+#include <features.h>
 #endif
 
 /* Define redis_fstat to fstat or fstat64() */
@@ -16,7 +50,10 @@
 
 /* Test for proc filesystem */
 #ifdef __linux__
-#define HAVE_PROCFS 1
+#define HAVE_PROC_STAT 1
+#define HAVE_PROC_MAPS 1
+#define HAVE_PROC_SMAPS 1
+#define HAVE_PROC_SOMAXCONN 1
 #endif
 
 /* Test for task_info() */
@@ -25,8 +62,13 @@
 #endif
 
 /* Test for backtrace() */
-#if defined(__APPLE__) || defined(__linux__) || defined(__sun)
+#if defined(__APPLE__) || (defined(__linux__) && defined(__GLIBC__))
 #define HAVE_BACKTRACE 1
+#endif
+
+/* MSG_NOSIGNAL. */
+#ifdef __linux__
+#define HAVE_MSG_NOSIGNAL 1
 #endif
 
 /* Test for polling API */
@@ -38,11 +80,52 @@
 #define HAVE_KQUEUE 1
 #endif
 
+#ifdef __sun
+#include <sys/feature_tests.h>
+#ifdef _DTRACE_VERSION
+#define HAVE_EVPORT 1
+#endif
+#endif
+
 /* Define aof_fsync to fdatasync() in Linux and fsync() for all the rest */
 #ifdef __linux__
 #define aof_fsync fdatasync
 #else
 #define aof_fsync fsync
+#endif
+
+/* Define rdb_fsync_range to sync_file_range() on Linux, otherwise we use
+ * the plain fsync() call. */
+#ifdef __linux__
+#if defined(__GLIBC__) && defined(__GLIBC_PREREQ)
+#if (LINUX_VERSION_CODE >= 0x020611 && __GLIBC_PREREQ(2, 6))
+#define HAVE_SYNC_FILE_RANGE 1
+#endif
+#else
+#if (LINUX_VERSION_CODE >= 0x020611)
+#define HAVE_SYNC_FILE_RANGE 1
+#endif
+#endif
+#endif
+
+#ifdef HAVE_SYNC_FILE_RANGE
+#define rdb_fsync_range(fd,off,size) sync_file_range(fd,off,size,SYNC_FILE_RANGE_WAIT_BEFORE|SYNC_FILE_RANGE_WRITE)
+#else
+#define rdb_fsync_range(fd,off,size) fsync(fd)
+#endif
+
+/* Check if we can use setproctitle().
+ * BSD systems have support for it, we provide an implementation for
+ * Linux and osx. */
+#if (defined __NetBSD__ || defined __FreeBSD__ || defined __OpenBSD__)
+#define USE_SETPROCTITLE
+#endif
+
+#if ((defined __linux && defined(__GLIBC__)) || defined __APPLE__)
+#define USE_SETPROCTITLE
+#define INIT_SETPROCTITLE_REPLACEMENT
+void spt_init(int argc, char *argv[]);
+void setproctitle(const char *fmt, ...);
 #endif
 
 /* Byte ordering detection */
@@ -79,11 +162,25 @@
 #endif /* BSD */
 #endif /* BYTE_ORDER */
 
-#if defined(__BYTE_ORDER) && !defined(BYTE_ORDER)
+/* Sometimes after including an OS-specific header that defines the
+ * endianess we end with __BYTE_ORDER but not with BYTE_ORDER that is what
+ * the Redis code uses. In this case let's define everything without the
+ * underscores. */
+#ifndef BYTE_ORDER
+#ifdef __BYTE_ORDER
+#if defined(__LITTLE_ENDIAN) && defined(__BIG_ENDIAN)
+#ifndef LITTLE_ENDIAN
+#define LITTLE_ENDIAN __LITTLE_ENDIAN
+#endif
+#ifndef BIG_ENDIAN
+#define BIG_ENDIAN __BIG_ENDIAN
+#endif
 #if (__BYTE_ORDER == __LITTLE_ENDIAN)
 #define BYTE_ORDER LITTLE_ENDIAN
 #else
 #define BYTE_ORDER BIG_ENDIAN
+#endif
+#endif
 #endif
 #endif
 
@@ -97,12 +194,34 @@
 #error "Undefined or invalid BYTE_ORDER"
 #endif
 
-#if (__i386 || __amd64) && __GNUC__
+#if (__i386 || __amd64 || __powerpc__) && __GNUC__
 #define GNUC_VERSION (__GNUC__ * 10000 + __GNUC_MINOR__ * 100 + __GNUC_PATCHLEVEL__)
-#if GNUC_VERSION >= 40100
+#if defined(__clang__)
+#define HAVE_ATOMIC
+#endif
+#if (defined(__GLIBC__) && defined(__GLIBC_PREREQ))
+#if (GNUC_VERSION >= 40100 && __GLIBC_PREREQ(2, 6))
 #define HAVE_ATOMIC
 #endif
 #endif
+#endif
 
+/* Make sure we can test for ARM just checking for __arm__, since sometimes
+ * __arm is defined but __arm__ is not. */
+#if defined(__arm) && !defined(__arm__)
+#define __arm__
+#endif
+#if defined (__aarch64__) && !defined(__arm64__)
+#define __arm64__
+#endif
+
+/* Make sure we can test for SPARC just checking for __sparc__. */
+#if defined(__sparc) && !defined(__sparc__)
+#define __sparc__
+#endif
+
+#if defined(__sparc__) || defined(__arm__)
+#define USE_ALIGNED_ACCESS
+#endif
 
 #endif
